@@ -75,6 +75,8 @@ with console.status("Provisioning server...") as status, LinodeSession(api_key=a
         status.update(status=f"{linode_info['status'].capitalize()} server...")
         time.sleep(5)
 
+    server_ip = linode_info["ipv4"][0]
+
     status.update(status="Connecting to server...")
 
     ssh = SSHClient()
@@ -82,7 +84,7 @@ with console.status("Provisioning server...") as status, LinodeSession(api_key=a
     ssh.set_missing_host_key_policy(AutoAddPolicy())
     while True:
         try:
-            ssh.connect(linode_info["ipv4"][0], username="root", password=root_pass)
+            ssh.connect(server_ip, username="root", password=root_pass)
             break
         except NoValidConnectionsError:
             time.sleep(2)
@@ -93,7 +95,7 @@ with console.status("Provisioning server...") as status, LinodeSession(api_key=a
 
     # _, stdout, _ = ssh.exec_command("yes | pacman -Syu")
     # read_stdout(stdout)
-    _, stdout, _ = ssh.exec_command("apt update && apt install -yy wireguard > /dev/null 2>&1", get_pty=True)
+    _, stdout, _ = ssh.exec_command("apt update && apt install -yy wireguard iptables > /dev/null 2>&1", get_pty=True)
     stdout.channel.recv_exit_status()
 
     # Server keys
@@ -130,3 +132,26 @@ PublicKey = {client_pub}
 AllowedIPs = 10.0.0.2/32
 EOF""")
     stdout.channel.recv_exit_status()
+
+    console.print("[green]✓[/green] Wireguard configured")
+    status.update("Starting wireguard service...")
+
+    _, stdout, _ = ssh.exec_command("systemctl enable wg-quick@wg0 && systemctl start wg-quick@wg0")
+    stdout.channel.recv_exit_status()
+
+    status.update("[green]✓[/green] Wireguard services successfully started")
+
+console.print()
+console.print(f"""[cyan]Client config:[/cyan]
+[Interface]
+PrivateKey = {client_priv}
+Address = 10.0.0.2/32
+DNS = 1.1.1.1, 1.0.0.1
+MTU = 1380
+
+[Peer]
+PublicKey = {server_pub}
+AllowedIPs = 0.0.0.0/0
+Endpoint = {server_ip}:443
+PersistentKeepalive = 21
+""")
