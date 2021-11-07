@@ -3,6 +3,7 @@ import string
 import secrets
 import requests
 from rich import print
+from rich.markup import escape
 from rich.console import Console
 from paramiko import SSHClient, AutoAddPolicy
 from paramiko.ssh_exception import NoValidConnectionsError
@@ -36,6 +37,10 @@ api_key = inquire("Enter your Linode API key")
 
 # print(api_key)
 
+def read_stdout(stdout):
+    for line in iter(stdout.readline, ""):
+        console.print(line, end="")
+
 class LinodeSession(requests.Session):
     def __init__(self, api_key=None, *args, **kwargs):
         super(LinodeSession, self).__init__(*args, **kwargs)
@@ -54,10 +59,10 @@ with console.status("Provisioning server...") as status, LinodeSession(api_key=a
     console.print("[green]✓[/green] Linode types retrieved")
 
     root_pass = generatePassword(12)
-    console.print(f"[green]✓[/green] Root password generated: [red]{root_pass}[/red]")
+    console.print(f"[green]✓[/green] Root password generated: [red]{escape(root_pass)}[/red]")
 
     linode = ls.post("/linode/instances", json={
-        "image": "linode/arch",
+        "image": "linode/debian11",
         "region": region["id"],
         "type": linode_type["id"],
         "root_pass": root_pass
@@ -82,4 +87,46 @@ with console.status("Provisioning server...") as status, LinodeSession(api_key=a
         except NoValidConnectionsError:
             time.sleep(2)
     _, stdout, _ = ssh.exec_command("whoami")
-    console.print(f"[green]✓[/green] Logged in as {stdout.read().strip().decode()}")
+    console.print(f"[green]✓[/green] Logged in as [green]{stdout.read().strip().decode()}[/green]")
+
+    status.update(status="Installing wireguard on the server...")
+
+    # _, stdout, _ = ssh.exec_command("yes | pacman -Syu")
+    # read_stdout(stdout)
+    _, stdout, _ = ssh.exec_command("apt update && apt install -yy wireguard > /dev/null 2>&1", get_pty=True)
+    stdout.channel.recv_exit_status()
+
+    # Server keys
+    _, stdout, _ = ssh.exec_command("wg genkey", get_pty=True)
+    server_priv = stdout.read().strip().decode()
+    console.print(f"[green]✓[/green] Generated server private key: [red]{server_priv}[/red]")
+    _, stdout, _ = ssh.exec_command(f"echo {server_priv} | wg pubkey")
+    server_pub = stdout.read().strip().decode()
+    console.print(f"[green]✓[/green] Generated server public key: [green]{server_pub}[/green]")
+
+    # Client keys
+    _, stdout, _ = ssh.exec_command("wg genkey")
+    client_priv = stdout.read().strip().decode()
+    console.print(f"[green]✓[/green] Generated client private key: [red]{client_priv}[/red]")
+    _, stdout, _ = ssh.exec_command(f"echo {client_priv} | wg pubkey")
+    client_pub = stdout.read().strip().decode()
+    console.print(f"[green]✓[/green] Generated client public key: [green]{client_pub}[/green]")
+
+    ssh.exec_command(f"echo 1 > /proc/sys/net/ipv4/ip_forward")
+    console.print("[green]✓[/green] Enable IPv4 forwarding")
+
+    # Write config file
+    _, stdout, _ = ssh.exec_command(f"""cat > /etc/wireguard/wg0.conf << 'EOF'
+[Interface]
+Address = 10.0.0.1/24
+SaveConfig = false
+PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o ens4 -j MASQUERADE; ip6tables -A FORWARD -i %i -j ACCEPT; ip6tables -t nat -A POSTROUTING -o ens4 -j MASQUERADE
+PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o ens4 -j MASQUERADE; ip6tables -D FORWARD -i %i -j ACCEPT; ip6tables -t nat -D POSTROUTING -o ens4 -j MASQUERADE
+ListenPort = 443
+PrivateKey = {server_priv}
+
+[Peer]
+PublicKey = {client_pub}
+AllowedIPs = 10.0.0.2/32
+EOF""")
+    stdout.channel.recv_exit_status()
